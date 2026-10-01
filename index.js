@@ -1,0 +1,504 @@
+/**
+ * dsh-desktop-account-switcher — host half.
+ *
+ * Saves the active DeepSeek Platform grant into a local account library and
+ * swaps stored grants back into the credentials record on demand. Replacing
+ * the grant record is exactly what the upstream sign-in commit does, so the
+ * account service reacts through its normal credentials/record-updated path:
+ * inference picks up the new token without a restart.
+ *
+ * Library: <DSH_HOME>/account-switcher/accounts.json
+ *   { "version": 1, "accounts": [ { id, token, issuer, name, contact,
+ *       avatarUrl, addedAt, invalid? } ] }
+ * Account id = first 12 hex chars of sha256(token).
+ */
+import { createHash } from 'node:crypto'
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+
+export const name = 'dsh-desktop-account-switcher'
+export const inject = ['credentials']
+
+export const STATE_PATH = '/dsh-desktop/account-switcher/state'
+export const SAVE_PATH = '/dsh-desktop/account-switcher/save'
+export const SWITCH_PATH = '/dsh-desktop/account-switcher/switch'
+export const REMOVE_PATH = '/dsh-desktop/account-switcher/remove'
+export const RENAME_PATH = '/dsh-desktop/account-switcher/rename'
+
+/** Credentials record holding the active Platform grant (kind: grant). */
+const CREDENTIAL_KEY = 'deepseek-account-platform/default'
+const DEFAULT_ISSUER = 'https://platform.deepseek.com'
+const PROFILE_TIMEOUT_MS = 8000
+const MAX_BODY_BYTES = 64 * 1024
+const STORE_VERSION = 1
+
+function dshHome() {
+  return process.env.DSH_HOME || join(homedir(), '.dsh')
+}
+
+function storeFile(home = dshHome()) {
+  return join(home, 'account-switcher', 'accounts.json')
+}
+
+/** Normalized origin string for grant issuer comparisons. */
+function normalizeIssuer(value) {
+  try {
+    return new URL(String(value)).origin
+  } catch {
+    return DEFAULT_ISSUER
+  }
+}
+
+function fingerprint(token) {
+  return createHash('sha256').update(String(token)).digest('hex').slice(0, 12)
+}
+
+function isLoopback(address) {
+  return (
+    address === '127.0.0.1' ||
+    address === '::1' ||
+    address === '::ffff:127.0.0.1'
+  )
+}
+
+function hasForwardedAddress(req) {
+  return Boolean(
+    req.headers.forwarded ||
+      req.headers['x-forwarded-for'] ||
+      req.headers['x-real-ip'] ||
+      req.headers['x-forwarded-host']
+  )
+}
+
+function isTrustedRequest(req, mutation = false) {
+  if (!isLoopback(req.socket.remoteAddress) || hasForwardedAddress(req)) return false
+  if (!mutation) return true
+
+  const origin = req.headers.origin
+  const host = req.headers.host
+  if (typeof origin !== 'string' || typeof host !== 'string') return false
+  try {
+    const parsed = new URL(origin)
+    return parsed.protocol === 'http:' && parsed.host === host && isLoopback(parsed.hostname)
+  } catch {
+    return false
+  }
+}
+
+function sendJson(res, status, payload) {
+  const body = JSON.stringify(payload)
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body)
+  })
+  res.end(body)
+}
+
+function readBody(req) {
+  return new Promise((resolveBody) => {
+    const chunks = []
+    let size = 0
+    let done = false
+    const finish = (value) => {
+      if (done) return
+      done = true
+      resolveBody(value)
+    }
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        finish({})
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8')
+        const value = text.trim() === '' ? {} : JSON.parse(text)
+        finish(value && typeof value === 'object' && !Array.isArray(value) ? value : {})
+      } catch {
+        finish({})
+      }
+    })
+    req.on('error', () => finish({}))
+  })
+}
+
+/** Client identity headers for one Platform call, mirroring platformClientHeaders. */
+function clientHeaders() {
+  let version = '1.0.0'
+  try {
+    version = createRequire(import.meta.url)('@deepseek-ai/dsh/package.json').version || version
+  } catch {
+    // keep fallback
+  }
+  return {
+    'x-client-bundle-id': '',
+    'x-client-platform': process.platform === 'win32' ? 'desktop-win' : 'desktop-mac',
+    'x-client-version': String(version),
+    'x-client-locale': 'zh_CN',
+    'x-client-timezone-offset': String(-(new Date()).getTimezoneOffset() * 60)
+  }
+}
+
+/**
+ * Read one token's Platform profile without touching stored credentials.
+ * @returns { Promise<{ profile?: { name: string|null, contact: string|null, avatarUrl: string|null }, unauthorized?: boolean }> }
+ */
+async function queryProfile(origin, token) {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), PROFILE_TIMEOUT_MS)
+  try {
+    const response = await fetch(new URL('/auth-api/v0/users/current', origin), {
+      method: 'GET',
+      redirect: 'error',
+      signal: controller.signal,
+      headers: { ...clientHeaders(), 'x-dsh-auth-token': token }
+    })
+    if (response.status === 401) return { unauthorized: true }
+    if (!response.ok) return {}
+    const payload = await response.json()
+    const data = payload && typeof payload === 'object'
+      ? (payload.biz_data && typeof payload.biz_data === 'object' ? payload.biz_data
+        : payload.data && typeof payload.data === 'object' ? payload.data
+          : payload)
+      : null
+    if (!data || typeof data !== 'object') return {}
+    const identity = data.id_profile && typeof data.id_profile === 'object' ? data.id_profile : {}
+    return {
+      profile: {
+        name: typeof identity.name === 'string' && identity.name !== '' ? identity.name : null,
+        contact: typeof data.mobile === 'string' && data.mobile !== '' ? data.mobile
+          : typeof data.mobile_number === 'string' && data.mobile_number !== '' ? data.mobile_number
+            : typeof data.email === 'string' && data.email !== '' ? data.email
+              : null,
+        avatarUrl: typeof identity.picture === 'string' && identity.picture !== '' ? identity.picture : null
+      }
+    }
+  } catch {
+    return {}
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+export async function apply(ctx) {
+  const home = dshHome()
+  const libraryFile = storeFile(home)
+
+  /** Serialized library mutations. */
+  let writeChain = Promise.resolve()
+  const enqueue = (operation) => {
+    const next = writeChain.then(operation, operation)
+    writeChain = next.then(() => undefined, () => undefined)
+    return next
+  }
+
+  const readLibrary = async () => {
+    try {
+      const text = await readFile(libraryFile, 'utf8')
+      const value = JSON.parse(text)
+      const accounts = Array.isArray(value?.accounts) ? value.accounts : []
+      return {
+        version: STORE_VERSION,
+        accounts: accounts.filter((row) => row && typeof row.token === 'string' && row.token !== '')
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') ctx.logger?.warn?.(error instanceof Error ? error : new Error(String(error)))
+      return { version: STORE_VERSION, accounts: [] }
+    }
+  }
+
+  const writeLibrary = (accounts) => enqueue(async () => {
+    await mkdir(dirname(libraryFile), { recursive: true })
+    const text = JSON.stringify({ version: STORE_VERSION, accounts }, null, 2) + '\n'
+    const temporary = libraryFile + '.tmp-' + process.pid + '-' + Date.now()
+    await writeFile(temporary, text, 'utf8')
+    await rename(temporary, libraryFile).catch(async (error) => {
+      await rm(temporary, { force: true }).catch(() => undefined)
+      throw error
+    })
+  })
+
+  /** In-memory profile cache keyed by account fingerprint. */
+  const profileCache = new Map()
+
+  const readActiveGrant = async (credentials) => {
+    try {
+      const record = await credentials.readRecord(CREDENTIAL_KEY)
+      if (!record || record.kind !== 'grant') return null
+      const payload = record.payload
+      if (!payload || payload.version !== 1 || typeof payload.token !== 'string' || payload.token === '') return null
+      const issuer = typeof payload.issuer === 'string' && payload.issuer !== '' ? normalizeIssuer(payload.issuer) : DEFAULT_ISSUER
+      return { token: payload.token, issuer }
+    } catch {
+      return null
+    }
+  }
+
+  const upsertLibrary = async (grant, profile) => {
+    const library = await readLibrary()
+    const id = fingerprint(grant.token)
+    const existing = library.accounts.find((row) => row.id === id)
+    const entry = {
+      id,
+      token: grant.token,
+      issuer: grant.issuer ? normalizeIssuer(grant.issuer) : DEFAULT_ISSUER,
+      name: profile?.name ?? existing?.name ?? null,
+      contact: profile?.contact ?? existing?.contact ?? null,
+      avatarUrl: profile?.avatarUrl ?? existing?.avatarUrl ?? null,
+      alias: existing?.alias ?? null,
+      addedAt: existing?.addedAt ?? Date.now()
+    }
+    if (entry.name !== null) entry.invalid = false
+    library.accounts = [entry, ...library.accounts.filter((row) => row.id !== id)]
+    await writeLibrary(library.accounts)
+    profileCache.set(id, { name: entry.name, contact: entry.contact, avatarUrl: entry.avatarUrl })
+    return entry
+  }
+
+  /** Sequential background refresh of display names for library entries. */
+  let refreshTimer
+  let refreshing = false
+  const scheduleNameRefresh = (delayMs = 400) => {
+    clearTimeout(refreshTimer)
+    refreshTimer = setTimeout(async () => {
+      if (refreshing) return
+      refreshing = true
+      try {
+        const credentials = ctx.credentials
+        if (!credentials) return
+        const library = await readLibrary()
+        const active = await readActiveGrant(credentials)
+        const rows = [...library.accounts.map((row) => ({ row, token: row.token, issuer: row.issuer }))]
+        if (active && !rows.some((item) => item.row.id === fingerprint(active.token))) {
+          rows.push({ row: null, token: active.token, issuer: active.issuer })
+        }
+        for (const item of rows) {
+          const id = fingerprint(item.token)
+          const cached = profileCache.get(id)
+          if (cached && cached.name !== null && cached.name !== undefined) continue
+          if (item.row?.invalid === true && cached) continue
+          const outcome = await queryProfile(item.issuer || DEFAULT_ISSUER, item.token)
+          if (outcome.unauthorized) {
+            profileCache.set(id, { name: null, contact: null, avatarUrl: null, invalid: true })
+            if (item.row) {
+              item.row.invalid = true
+              const libraryNow = await readLibrary()
+              await writeLibrary(libraryNow.accounts.map((row) => row.id === id ? { ...row, invalid: true } : row))
+            }
+            continue
+          }
+          if (outcome.profile) {
+            profileCache.set(id, outcome.profile)
+            if (item.row) {
+              const libraryNow = await readLibrary()
+              await writeLibrary(libraryNow.accounts.map((row) => row.id === id
+                ? { ...row, name: outcome.profile.name, contact: outcome.profile.contact, avatarUrl: outcome.profile.avatarUrl, invalid: false }
+                : row))
+            }
+          }
+        }
+      } catch (error) {
+        ctx.logger?.warn?.(error instanceof Error ? error : new Error(String(error)))
+      } finally {
+        refreshing = false
+      }
+    }, delayMs)
+    refreshTimer.unref?.()
+  }
+
+  const buildState = async (credentials) => {
+    const [library, active] = [await readLibrary(), await readActiveGrant(credentials)]
+    const activeId = active === null ? null : fingerprint(active.token)
+    const displayName = (id, fallback) => {
+      const entry = library.accounts.find((row) => row.id === id)
+      const cached = profileCache.get(id) ?? {}
+      return {
+        name: cached.name ?? entry?.name ?? null,
+        contact: cached.contact ?? entry?.contact ?? null,
+        avatarUrl: cached.avatarUrl ?? entry?.avatarUrl ?? null,
+        alias: entry?.alias ?? null,
+        invalid: cached.invalid === true || entry?.invalid === true
+      }
+    }
+    const current = active === null ? null : {
+      id: activeId,
+      saved: library.accounts.some((row) => row.id === activeId),
+      issuer: active.issuer,
+      ...displayName(activeId)
+    }
+    const accounts = library.accounts.map((row) => ({
+      id: row.id,
+      addedAt: row.addedAt ?? null,
+      active: row.id === activeId,
+      ...displayName(row.id)
+    }))
+    return { current, accounts }
+  }
+
+  ctx.inject(['webServer'], (webCtx) => webCtx.effect(() => {
+    const withCredentials = async (res, operation) => {
+      const credentials = ctx.credentials
+      if (!credentials || typeof credentials.readRecord !== 'function') {
+        sendJson(res, 500, { error: 'credentials service unavailable' })
+        return null
+      }
+      try {
+        return await operation(credentials)
+      } catch (error) {
+        ctx.logger?.warn?.(error instanceof Error ? error : new Error(String(error)))
+        sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
+        return null
+      }
+    }
+
+    const disposeState = webCtx.webServer.register({
+      kind: 'exact',
+      path: STATE_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'GET' || !isTrustedRequest(req)) {
+          sendJson(res, req.method === 'GET' ? 403 : 405, { error: 'Request rejected.' })
+          return
+        }
+        await withCredentials(res, async (credentials) => {
+          scheduleNameRefresh()
+          sendJson(res, 200, await buildState(credentials))
+        })
+      }
+    })
+
+    const disposeSave = webCtx.webServer.register({
+      kind: 'exact',
+      path: SAVE_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
+          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
+          return
+        }
+        await withCredentials(res, async (credentials) => {
+          const active = await readActiveGrant(credentials)
+          if (active === null) {
+            sendJson(res, 409, { error: '当前没有已登录的账号可保存。' })
+            return
+          }
+          const entry = await upsertLibrary(active, profileCache.get(fingerprint(active.token)) ?? null)
+          scheduleNameRefresh()
+          sendJson(res, 200, { ...(await buildState(credentials)), savedId: entry.id })
+        })
+      }
+    })
+
+    const disposeSwitch = webCtx.webServer.register({
+      kind: 'exact',
+      path: SWITCH_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
+          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
+          return
+        }
+        const body = await readBody(req)
+        await withCredentials(res, async (credentials) => {
+          const targetId = typeof body.id === 'string' ? body.id : ''
+          const library = await readLibrary()
+          const target = library.accounts.find((row) => row.id === targetId)
+          if (!target) {
+            sendJson(res, 404, { error: '账号库中找不到该账号。' })
+            return
+          }
+          const active = await readActiveGrant(credentials)
+          const activeId = active === null ? null : fingerprint(active.token)
+          if (activeId === targetId) {
+            sendJson(res, 200, await buildState(credentials))
+            return
+          }
+          // Preserve the outgoing grant before it is overwritten.
+          if (active !== null && !library.accounts.some((row) => row.id === activeId)) {
+            await upsertLibrary(active, profileCache.get(activeId) ?? null)
+          }
+          await credentials.modifyRecord(CREDENTIAL_KEY, () => ({
+            kind: 'grant',
+            payload: { version: 1, token: target.token, issuer: target.issuer ? normalizeIssuer(target.issuer) : DEFAULT_ISSUER }
+          }))
+          scheduleNameRefresh()
+          sendJson(res, 200, { ...(await buildState(credentials)), activeId: targetId })
+        })
+      }
+    })
+
+    const disposeRemove = webCtx.webServer.register({
+      kind: 'exact',
+      path: REMOVE_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
+          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
+          return
+        }
+        const body = await readBody(req)
+        await withCredentials(res, async (credentials) => {
+          const targetId = typeof body.id === 'string' ? body.id : ''
+          const active = await readActiveGrant(credentials)
+          if (active !== null && fingerprint(active.token) === targetId) {
+            sendJson(res, 409, { error: '该账号正在使用中，不能删除。' })
+            return
+          }
+          const library = await readLibrary()
+          const remaining = library.accounts.filter((row) => row.id !== targetId)
+          if (remaining.length === library.accounts.length) {
+            sendJson(res, 404, { error: '账号库中找不到该账号。' })
+            return
+          }
+          await writeLibrary(remaining)
+          sendJson(res, 200, await buildState(credentials))
+        })
+      }
+    })
+
+    const disposeRename = webCtx.webServer.register({
+      kind: 'exact',
+      path: RENAME_PATH,
+      handler: async (req, res) => {
+        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
+          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
+          return
+        }
+        const body = await readBody(req)
+        await withCredentials(res, async (credentials) => {
+          const targetId = typeof body.id === 'string' ? body.id : ''
+          const raw = typeof body.name === 'string' ? body.name.trim() : ''
+          if (raw.length > 40) {
+            sendJson(res, 400, { error: '备注名过长（最多 40 个字符）。' })
+            return
+          }
+          const library = await readLibrary()
+          const target = library.accounts.find((row) => row.id === targetId)
+          if (!target) {
+            sendJson(res, 404, { error: '账号库中找不到该账号。' })
+            return
+          }
+          const next = library.accounts.map((row) => row.id !== targetId ? row : { ...row, alias: raw === '' ? null : raw })
+          await writeLibrary(next)
+          sendJson(res, 200, await buildState(credentials))
+        })
+      }
+    })
+
+    scheduleNameRefresh(1200)
+
+    return () => {
+      disposeRename()
+      disposeRemove()
+      disposeSwitch()
+      disposeSave()
+      disposeState()
+      clearTimeout(refreshTimer)
+    }
+  }, 'dsh-desktop-account-switcher: account library routes'))
+
+  ctx.logger?.info?.('[dsh-desktop-account-switcher] routes registered under /dsh-desktop/account-switcher/')
+}

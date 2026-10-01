@@ -1,0 +1,66 @@
+{
+  "name": "dsh-desktop-account-switcher",
+  "description": "Settings section to save, label and switch DeepSeek accounts locally in DSH Desktop",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "skills",
+    "dsh.plugin.json",
+    "cordis.patch.yml",
+    "README.md",
+    "README.en.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "account-switcher",
+    "settings",
+    "多账号",
+    "切换账号"
+  ],
+  "engines": {
+    "dsh": ">=0.1.0-rc.6"
+  },
+  "dsh": {
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-api-remotes",
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ],
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.1.0-rc.6": "compatible",
+        "0.1.0-rc.7": "compatible",
+        "0.1.7-rc.2": "compatible"
+      }
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NANNAN223/dsh-desktop-account-switcher.git"
+  },
+  "homepage": "https://github.com/NANNAN223/dsh-desktop-account-switcher#readme",
+  "bugs": {
+    "url": "https://github.com/NANNAN223/dsh-desktop-account-switcher/issues"
+  }
+}

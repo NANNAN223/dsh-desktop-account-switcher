@@ -1,0 +1,13 @@
+{
+  "id": "dsh-desktop-account-switcher",
+  "version": "0.1.0",
+  "main": "./index.js",
+  "description": "Settings section to save, label and switch DeepSeek accounts locally in DSH Desktop",
+  "engines": {
+    "dsh": ">=0.1.0-rc.6"
+  },
+  "contributes": {
+    "tools": [],
+    "skills": []
+  }
+}

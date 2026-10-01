@@ -1,0 +1,5 @@
+# dsh-desktop-account-switcher bundle patch: mount the host plugin that serves
+# /dsh-desktop/account-switcher/* routes and registers the settings section.
+- insert:
+    - id: dsh-desktop-account-switcher
+      name: 'dsh-desktop-account-switcher'
