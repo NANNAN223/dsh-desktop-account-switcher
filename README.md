@@ -12,26 +12,49 @@ DSH Desktop 的 DeepSeek 多账号切换插件:在 **设置 → 账号切换** �
 - **失效标记**:token 失效的账号自动标记;当前使用中的账号禁止删除
 - 中英双语,跟随系统语言
 
-## 安装
+## 安装(GitHub 直接安装,推荐)
 
-### 方式 A:DSH Community Market(推荐)
+无需 npm 市场,用 git 拉取即可。
 
-DSH Desktop → 设置 → 插件 → 社区市场,搜索 `account-switcher` 安装,重启 DSH。
+### 第 1 步:克隆插件到 DSH 插件目录
 
-### 方式 B:手动安装
+PowerShell 里执行(把第一行的路径换成你的 DSH 实际安装路径):
 
-1. 复制本包到 `<DSH 安装目录>/resources/app.asar.unpacked/node_modules/dsh-desktop-account-switcher`
-2. 在 `<用户目录>/AppData/Roaming/dsh-desktop/harness/profiles/web/cordis.patch.yml` 追加:
+```powershell
+cd "D:\dsh\DSH Desktop\resources\app.asar.unpacked\node_modules"
+git clone https://github.com/NANNAN223/dsh-desktop-account-switcher.git dsh-desktop-account-switcher
+```
+
+> 末尾的 `dsh-desktop-account-switcher` 指定目录名,**必须**叫这个名字。
+
+### 第 2 步:挂载插件
+
+用记事本打开补丁文件:
+
+```powershell
+notepad "$env:APPDATA\dsh-desktop\harness\profiles\web\cordis.patch.yml"
+```
+
+在文件末尾追加(把路径换成你的实际安装路径):
 
 ```yaml
 - insert:
     - id: dsh-desktop-account-switcher
-      name: "file:///<DSH 安装目录>/resources/app.asar.unpacked/node_modules/dsh-desktop-account-switcher/index.js"
+      name: "file:///D:/dsh/DSH%20Desktop/resources/app.asar.unpacked/node_modules/dsh-desktop-account-switcher/index.js"
 ```
 
-3. 重启 DSH。
+路径书写规则:`file:///` 开头 + 完整路径,**正斜杠**,路径里的**空格写成 %20**(如 `DSH Desktop` → `DSH%20Desktop`);路径没有空格则原样即可。
 
-> 若之前手动装过同 id 条目,请先删除旧行再从市场安装,避免重复挂载。
+### 第 3 步:重启 DSH
+
+设置 → 账号切换,出现面板即安装成功。
+
+### 更新与卸载
+
+- 更新:进入插件目录 `git pull`,重启 DSH。
+- 卸载:删除插件目录,并删除 cordis.patch.yml 里对应 `- insert:` 段。
+
+> 若之前手动装过同 id 条目,请先删除旧行,避免重复挂载。npm 插件市场版本因注册受阻暂未上架,后续上架后市场搜索 `account-switcher` 即可。
 
 ## 数据与安全
 

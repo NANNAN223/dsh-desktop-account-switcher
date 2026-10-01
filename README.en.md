@@ -4,8 +4,23 @@ Save, label and switch multiple DeepSeek accounts in DSH Desktop (Settings → A
 
 ## Install
 
-- **Market (recommended):** DSH Desktop → Settings → Plugins → Community Market, search `account-switcher`.
-- **Manual:** copy this package into `resources/app.asar.unpacked/node_modules/`, add the `insert` row from README.md to `harness/profiles/web/cordis.patch.yml`, restart DSH.
+- **Install from GitHub (recommended):** clone into DSH's plugin directory and add one mount row — full commands in [README.md](./README.md):
+
+```powershell
+cd "<DSH install path>\resources\app.asar.unpacked\node_modules"
+git clone https://github.com/NANNAN223/dsh-desktop-account-switcher.git dsh-desktop-account-switcher
+```
+
+then append to `$env:APPDATA\dsh-desktop\harness\profiles\web\cordis.patch.yml`:
+
+```yaml
+- insert:
+    - id: dsh-desktop-account-switcher
+      name: "file:///<DSH install path with forward slashes and %20 for spaces>/resources/app.asar.unpacked/node_modules/dsh-desktop-account-switcher/index.js"
+```
+
+and restart DSH. Update with `git pull` inside the plugin folder.
+- **Market:** npm release pending; not yet published.
 
 ## HTTP API (localhost only)
 
