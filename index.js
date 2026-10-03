@@ -1,15 +1,13 @@
 /**
- * dsh-desktop-account-switcher — host half.
+ * dsh-desktop-account-switcher v2 — host half (asw2-1).
  *
- * Saves the active DeepSeek Platform grant into a local account library and
- * swaps stored grants back into the credentials record on demand. Replacing
- * the grant record is exactly what the upstream sign-in commit does, so the
- * account service reacts through its normal credentials/record-updated path:
- * inference picks up the new token without a restart.
+ * v2 additions over v1: pinned flag per account (PIN_PATH), re-login swap
+ * (save accepts replaceId: the fresh grant carries over alias/addedAt/pinned
+ * from the stale entry and replaces it), and a self-check meta block in state.
  *
  * Library: <DSH_HOME>/account-switcher/accounts.json
  *   { "version": 1, "accounts": [ { id, token, issuer, name, contact,
- *       avatarUrl, addedAt, invalid? } ] }
+ *       avatarUrl, alias, addedAt, invalid?, pinned? } ] }
  * Account id = first 12 hex chars of sha256(token).
  */
 import { createHash } from 'node:crypto'
@@ -26,6 +24,7 @@ export const SAVE_PATH = '/dsh-desktop/account-switcher/save'
 export const SWITCH_PATH = '/dsh-desktop/account-switcher/switch'
 export const REMOVE_PATH = '/dsh-desktop/account-switcher/remove'
 export const RENAME_PATH = '/dsh-desktop/account-switcher/rename'
+export const PIN_PATH = '/dsh-desktop/account-switcher/pin'
 
 /** Credentials record holding the active Platform grant (kind: grant). */
 const CREDENTIAL_KEY = 'deepseek-account-platform/default'
@@ -33,6 +32,10 @@ const DEFAULT_ISSUER = 'https://platform.deepseek.com'
 const PROFILE_TIMEOUT_MS = 8000
 const MAX_BODY_BYTES = 64 * 1024
 const STORE_VERSION = 1
+const LIB_VERSION = 'asw2-1'
+const MAX_ALIAS = 40
+// Real client version; keep in sync when upgrading DSH.
+const CLIENT_VERSION = '0.2.0-rc.2'
 
 function dshHome() {
   return process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -42,7 +45,6 @@ function storeFile(home = dshHome()) {
   return join(home, 'account-switcher', 'accounts.json')
 }
 
-/** Normalized origin string for grant issuer comparisons. */
 function normalizeIssuer(value) {
   try {
     return new URL(String(value)).origin
@@ -56,11 +58,7 @@ function fingerprint(token) {
 }
 
 function isLoopback(address) {
-  return (
-    address === '127.0.0.1' ||
-    address === '::1' ||
-    address === '::ffff:127.0.0.1'
-  )
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
 function hasForwardedAddress(req) {
@@ -75,7 +73,6 @@ function hasForwardedAddress(req) {
 function isTrustedRequest(req, mutation = false) {
   if (!isLoopback(req.socket.remoteAddress) || hasForwardedAddress(req)) return false
   if (!mutation) return true
-
   const origin = req.headers.origin
   const host = req.headers.host
   if (typeof origin !== 'string' || typeof host !== 'string') return false
@@ -129,13 +126,12 @@ function readBody(req) {
   })
 }
 
-/** Client identity headers for one Platform call, mirroring platformClientHeaders. */
 function clientHeaders() {
-  let version = '1.0.0'
+  let version = CLIENT_VERSION
   try {
     version = createRequire(import.meta.url)('@deepseek-ai/dsh/package.json').version || version
   } catch {
-    // keep fallback
+    // keep fallback (module moved into app.asar; resolution may fail here)
   }
   return {
     'x-client-bundle-id': '',
@@ -241,7 +237,7 @@ export async function apply(ctx) {
     }
   }
 
-  const upsertLibrary = async (grant, profile) => {
+  const upsertLibrary = async (grant, profile, carry = null) => {
     const library = await readLibrary()
     const id = fingerprint(grant.token)
     const existing = library.accounts.find((row) => row.id === id)
@@ -252,11 +248,15 @@ export async function apply(ctx) {
       name: profile?.name ?? existing?.name ?? null,
       contact: profile?.contact ?? existing?.contact ?? null,
       avatarUrl: profile?.avatarUrl ?? existing?.avatarUrl ?? null,
-      alias: existing?.alias ?? null,
-      addedAt: existing?.addedAt ?? Date.now()
+      alias: existing?.alias ?? carry?.alias ?? null,
+      addedAt: existing?.addedAt ?? carry?.addedAt ?? Date.now()
     }
+    const pinned = existing?.pinned === true || carry?.pinned === true
+    if (pinned) entry.pinned = true
     if (entry.name !== null) entry.invalid = false
-    library.accounts = [entry, ...library.accounts.filter((row) => row.id !== id)]
+    // Replace the stale entry when re-login carried it over.
+    const carryId = carry?.id
+    library.accounts = [entry, ...library.accounts.filter((row) => row.id !== id && row.id !== carryId)]
     await writeLibrary(library.accounts)
     profileCache.set(id, { name: entry.name, contact: entry.contact, avatarUrl: entry.avatarUrl })
     return entry
@@ -316,7 +316,7 @@ export async function apply(ctx) {
   const buildState = async (credentials) => {
     const [library, active] = [await readLibrary(), await readActiveGrant(credentials)]
     const activeId = active === null ? null : fingerprint(active.token)
-    const displayName = (id, fallback) => {
+    const displayName = (id) => {
       const entry = library.accounts.find((row) => row.id === id)
       const cached = profileCache.get(id) ?? {}
       return {
@@ -324,7 +324,8 @@ export async function apply(ctx) {
         contact: cached.contact ?? entry?.contact ?? null,
         avatarUrl: cached.avatarUrl ?? entry?.avatarUrl ?? null,
         alias: entry?.alias ?? null,
-        invalid: cached.invalid === true || entry?.invalid === true
+        invalid: cached.invalid === true || entry?.invalid === true,
+        pinned: entry?.pinned === true
       }
     }
     const current = active === null ? null : {
@@ -339,7 +340,16 @@ export async function apply(ctx) {
       active: row.id === activeId,
       ...displayName(row.id)
     }))
-    return { current, accounts }
+    return {
+      current,
+      accounts,
+      meta: {
+        lib: LIB_VERSION,
+        store: libraryFile,
+        total: accounts.length,
+        checkedAt: Date.now()
+      }
+    }
   }
 
   ctx.inject(['webServer'], (webCtx) => webCtx.effect(() => {
@@ -356,6 +366,14 @@ export async function apply(ctx) {
         sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) })
         return null
       }
+    }
+
+    const postOnly = (req, res) => {
+      if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
+        sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
+        return true
+      }
+      return false
     }
 
     const disposeState = webCtx.webServer.register({
@@ -377,19 +395,27 @@ export async function apply(ctx) {
       kind: 'exact',
       path: SAVE_PATH,
       handler: async (req, res) => {
-        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
-          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
-          return
-        }
+        if (postOnly(req, res)) return
+        const body = await readBody(req)
         await withCredentials(res, async (credentials) => {
           const active = await readActiveGrant(credentials)
           if (active === null) {
             sendJson(res, 409, { error: '当前没有已登录的账号可保存。' })
             return
           }
-          const entry = await upsertLibrary(active, profileCache.get(fingerprint(active.token)) ?? null)
+          // Re-login swap: carry alias/addedAt/pinned over from the stale entry.
+          let carry = null
+          const replaceId = typeof body.replaceId === 'string' ? body.replaceId : ''
+          if (replaceId !== '') {
+            const library = await readLibrary()
+            const stale = library.accounts.find((row) => row.id === replaceId)
+            if (stale && stale.id !== fingerprint(active.token)) {
+              carry = { id: stale.id, alias: stale.alias ?? null, addedAt: stale.addedAt, pinned: stale.pinned === true }
+            }
+          }
+          const entry = await upsertLibrary(active, profileCache.get(fingerprint(active.token)) ?? null, carry)
           scheduleNameRefresh()
-          sendJson(res, 200, { ...(await buildState(credentials)), savedId: entry.id })
+          sendJson(res, 200, { ...(await buildState(credentials)), savedId: entry.id, replaced: carry?.id ?? null })
         })
       }
     })
@@ -398,10 +424,7 @@ export async function apply(ctx) {
       kind: 'exact',
       path: SWITCH_PATH,
       handler: async (req, res) => {
-        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
-          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
-          return
-        }
+        if (postOnly(req, res)) return
         const body = await readBody(req)
         await withCredentials(res, async (credentials) => {
           const targetId = typeof body.id === 'string' ? body.id : ''
@@ -435,10 +458,7 @@ export async function apply(ctx) {
       kind: 'exact',
       path: REMOVE_PATH,
       handler: async (req, res) => {
-        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
-          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
-          return
-        }
+        if (postOnly(req, res)) return
         const body = await readBody(req)
         await withCredentials(res, async (credentials) => {
           const targetId = typeof body.id === 'string' ? body.id : ''
@@ -463,15 +483,12 @@ export async function apply(ctx) {
       kind: 'exact',
       path: RENAME_PATH,
       handler: async (req, res) => {
-        if (req.method !== 'POST' || !isTrustedRequest(req, true)) {
-          sendJson(res, req.method === 'POST' ? 403 : 405, { error: 'Request rejected.' })
-          return
-        }
+        if (postOnly(req, res)) return
         const body = await readBody(req)
         await withCredentials(res, async (credentials) => {
           const targetId = typeof body.id === 'string' ? body.id : ''
           const raw = typeof body.name === 'string' ? body.name.trim() : ''
-          if (raw.length > 40) {
+          if (raw.length > MAX_ALIAS) {
             sendJson(res, 400, { error: '备注名过长（最多 40 个字符）。' })
             return
           }
@@ -488,9 +505,37 @@ export async function apply(ctx) {
       }
     })
 
+    const disposePin = webCtx.webServer.register({
+      kind: 'exact',
+      path: PIN_PATH,
+      handler: async (req, res) => {
+        if (postOnly(req, res)) return
+        const body = await readBody(req)
+        await withCredentials(res, async (credentials) => {
+          const targetId = typeof body.id === 'string' ? body.id : ''
+          const library = await readLibrary()
+          const target = library.accounts.find((row) => row.id === targetId)
+          if (!target) {
+            sendJson(res, 404, { error: '账号库中找不到该账号。' })
+            return
+          }
+          const next = library.accounts.map((row) => {
+            if (row.id !== targetId) return row
+            const updated = { ...row }
+            if (body.pinned === true) updated.pinned = true
+            else delete updated.pinned
+            return updated
+          })
+          await writeLibrary(next)
+          sendJson(res, 200, await buildState(credentials))
+        })
+      }
+    })
+
     scheduleNameRefresh(1200)
 
     return () => {
+      disposePin()
       disposeRename()
       disposeRemove()
       disposeSwitch()
@@ -500,5 +545,5 @@ export async function apply(ctx) {
     }
   }, 'dsh-desktop-account-switcher: account library routes'))
 
-  ctx.logger?.info?.('[dsh-desktop-account-switcher] routes registered under /dsh-desktop/account-switcher/')
+  ctx.logger?.info?.('[dsh-desktop-account-switcher] v2 routes registered under /dsh-desktop/account-switcher/')
 }
