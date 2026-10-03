@@ -1,9 +1,13 @@
 /**
- * dsh-desktop-account-switcher v2 — host half (asw2-1).
+ * dsh-desktop-account-switcher v2 — host half (asw2-2).
  *
  * v2 additions over v1: pinned flag per account (PIN_PATH), re-login swap
  * (save accepts replaceId: the fresh grant carries over alias/addedAt/pinned
  * from the stale entry and replaces it), and a self-check meta block in state.
+ * asw2-2: in-app Electron sign-in window (SIGNIN_WINDOW_PATH) — the official
+ * platform sign-in page opens in a frameless BrowserWindow; navigation to
+ * /oauth/callback auto-closes it ~1.2s later. Falls back to window.open when
+ * electron is unavailable.
  *
  * Library: <DSH_HOME>/account-switcher/accounts.json
  *   { "version": 1, "accounts": [ { id, token, issuer, name, contact,
@@ -25,6 +29,9 @@ export const SWITCH_PATH = '/dsh-desktop/account-switcher/switch'
 export const REMOVE_PATH = '/dsh-desktop/account-switcher/remove'
 export const RENAME_PATH = '/dsh-desktop/account-switcher/rename'
 export const PIN_PATH = '/dsh-desktop/account-switcher/pin'
+export const SIGNIN_WINDOW_PATH = '/dsh-desktop/account-switcher/signin-window'
+export const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/close'
+
 
 /** Credentials record holding the active Platform grant (kind: grant). */
 const CREDENTIAL_KEY = 'deepseek-account-platform/default'
@@ -32,7 +39,7 @@ const DEFAULT_ISSUER = 'https://platform.deepseek.com'
 const PROFILE_TIMEOUT_MS = 8000
 const MAX_BODY_BYTES = 64 * 1024
 const STORE_VERSION = 1
-const LIB_VERSION = 'asw2-1'
+const LIB_VERSION = 'asw2-2'
 const MAX_ALIAS = 40
 // Real client version; keep in sync when upgrading DSH.
 const CLIENT_VERSION = '0.2.0-rc.2'
@@ -352,6 +359,10 @@ export async function apply(ctx) {
     }
   }
 
+  // 应用作用域持有登录窗句柄: 即使 effect 回调被再次调用, 新旧闭包也共享同一窗口引用。
+  let loginWindow = null
+  let loginWindowCloseTimer = null
+
   ctx.inject(['webServer'], (webCtx) => webCtx.effect(() => {
     const withCredentials = async (res, operation) => {
       const credentials = ctx.credentials
@@ -532,9 +543,110 @@ export async function apply(ctx) {
       }
     })
 
+    const SIGNIN_WINDOW_TITLE = 'DeepSeek 登录 / Sign in'
+
+    const isAllowedLoginUrl = (value) => {
+      try {
+        const parsed = new URL(String(value))
+        return parsed.protocol === 'https:' && /(^|\.)deepseek\.com$/i.test(parsed.hostname)
+      } catch {
+        return false
+      }
+    }
+
+    const closeSignWindow = () => {
+      clearTimeout(loginWindowCloseTimer)
+      loginWindowCloseTimer = null
+      if (loginWindow && !loginWindow.isDestroyed()) loginWindow.destroy()
+      loginWindow = null
+    }
+
+    const watchSignWindowNavigation = (win) => {
+      const check = (url) => {
+        try {
+          if (new URL(url).pathname === '/oauth/callback') {
+            // 登录 code 已到达本机交换端点；给平台 302 一点渲染时间后自动关窗。
+            clearTimeout(loginWindowCloseTimer)
+            loginWindowCloseTimer = setTimeout(() => closeSignWindow(), 1200)
+          }
+        } catch { /* 非 URL，忽略 */ }
+      }
+      win.webContents?.on?.('will-redirect', (_event, url) => check(url))
+      win.webContents?.on?.('did-navigate', (_event, url) => check(url))
+    }
+
+    const openSignWindow = async (body) => {
+      const target = typeof body?.url === 'string' ? body.url : ''
+      if (!isAllowedLoginUrl(target)) return { ok: false, error: '仅支持打开 DeepSeek 官方登录页。' }
+      let electronModule
+      try {
+        electronModule = await import('electron')
+      } catch {
+        return { ok: false, fallback: true }
+      }
+      const ns = electronModule && electronModule.default ? electronModule.default : electronModule
+      const BrowserWindow = ns && typeof ns.BrowserWindow === 'function' ? ns.BrowserWindow : null
+      if (!BrowserWindow) return { ok: false, fallback: true }
+      try {
+        closeSignWindow()
+        const owner = typeof BrowserWindow.getAllWindows === 'function'
+          ? BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed?.() && !candidate.getParentWindow?.())
+          : null
+        const win = new BrowserWindow({
+          width: 430,
+          height: 680,
+          title: SIGNIN_WINDOW_TITLE,
+          autoHideMenuBar: true,
+          show: false,
+          backgroundColor: '#ffffff',
+          ...(owner ? { parent: owner } : {}),
+          webPreferences: {
+            contextIsolation: true,
+            nodeIntegration: false,
+            sandbox: true,
+            spellcheck: false
+          }
+        })
+        win.once('ready-to-show', () => { try { win.show() } catch { /* 窗口已销毁 */ } })
+        win.on('closed', () => { if (loginWindow === win) loginWindow = null })
+        watchSignWindowNavigation(win)
+        await win.loadURL(target)
+        loginWindow = win
+        return { ok: true, embedded: true }
+      } catch (error) {
+        ctx.logger?.warn?.(error instanceof Error ? error : new Error(String(error)))
+        closeSignWindow()
+        return { ok: false, fallback: true }
+      }
+    }
+
+    const disposeSignWindow = webCtx.webServer.register({
+      kind: 'exact',
+      path: SIGNIN_WINDOW_PATH,
+      handler: async (req, res) => {
+        if (postOnly(req, res)) return
+        const body = await readBody(req)
+        sendJson(res, 200, await openSignWindow(body))
+      }
+    })
+
+    const disposeSignWindowClose = webCtx.webServer.register({
+      kind: 'exact',
+      path: SIGNIN_WINDOW_CLOSE_PATH,
+      handler: async (req, res) => {
+        if (postOnly(req, res)) return
+        await readBody(req)
+        closeSignWindow()
+        sendJson(res, 200, { ok: true })
+      }
+    })
+
     scheduleNameRefresh(1200)
 
     return () => {
+      closeSignWindow()
+      disposeSignWindowClose()
+      disposeSignWindow()
       disposePin()
       disposeRename()
       disposeRemove()

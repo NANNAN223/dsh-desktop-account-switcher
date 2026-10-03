@@ -5,7 +5,7 @@ DSH Desktop 的 DeepSeek 多账号切换插件:在 **设置 → 账号切换** �
 ## 功能
 
 - **保存当前账号**:把当前登录的 DeepSeek 账号存入本地账号库(token 仅存本机 `<DSH_HOME>/account-switcher/accounts.json`)
-- **登录新账号**:发起 DeepSeek 平台登录,成功后自动入库
+- **登录新账号**:在应用内窗口直接打开 DeepSeek 官方登录页(手机号/验证码/微信扫码),无需切换到外部浏览器;登录成功后窗口自动关闭、账号自动入库(electron 不可用时自动回退外部浏览器)
 - **一键切换**:切换后自动刷新页面,全站以新账号身份生效
 - **备注名**:给账号起别名(≤40 字),与官方资料名分开存储,留空恢复默认
 - **添加时间**:每个账号显示入库时间
@@ -79,10 +79,13 @@ notepad "$env:APPDATA\dsh-desktop\harness\profiles\web\cordis.patch.yml"
 | POST | `/dsh-desktop/account-switcher/switch` | `{"id"}` 切换 |
 | POST | `/dsh-desktop/account-switcher/rename` | `{"id","name"}` 备注,空串清除 |
 | POST | `/dsh-desktop/account-switcher/remove` | `{"id"}` 删除(当前号 409) |
+| POST | `/dsh-desktop/account-switcher/pin` | `{"id","pinned"}` 置顶/取消置顶 |
+| POST | `/dsh-desktop/account-switcher/signin-window` | `{"url"}` 在应用内窗口打开官方登录页(仅允许 deepseek.com) |
+| POST | `/dsh-desktop/account-switcher/signin-window/close` | 关闭登录窗口 |
 
 ## 兼容性
 
-DSH Desktop web 平台,engines `dsh >= 0.1.0-rc.6`(在 0.1.7-rc.2 上开发验证)。
+DSH Desktop web 平台,engines `dsh >= 0.2.0-rc.2`(在 DSH Desktop v0.11.0 上开发验证)。
 
 ## License
 

@@ -17,8 +17,10 @@ window.__ModuleLoader__.load({
     const REMOVE_PATH = '/dsh-desktop/account-switcher/remove'
     const RENAME_PATH = '/dsh-desktop/account-switcher/rename'
     const PIN_PATH = '/dsh-desktop/account-switcher/pin'
+const SIGNIN_WINDOW_PATH = '/dsh-desktop/account-switcher/signin-window'
+const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/close'
     const NS = 'settings.accountSwitcher'
-    const LIB_VERSION = 'asw2-1'
+    const LIB_VERSION = 'asw2-2'
     const CLIENT_VERSION = '0.2.0-rc.2'
 
     const zh = {
@@ -49,6 +51,7 @@ window.__ModuleLoader__.load({
       reloginDone: '已重新登录，账号已更新。',
       addAccount: '登录新账号…',
       signInHint: '浏览器窗口已打开授权页，完成登录后这里会自动继续。',
+  signInAppHint: '已在本应用窗口打开官方登录页，完成登录后窗口会自动关闭、账号自动入库。',
       signInLink: '打不开窗口？点这里手动打开授权链接。',
       signInCancel: '取消登录',
       signedInNew: '登录成功，新账号已加入账号库。',
@@ -93,6 +96,7 @@ window.__ModuleLoader__.load({
       reloginDone: 'Re-signed in; the account was updated.',
       addAccount: 'Sign in with another account…',
       signInHint: 'A browser window opened for authorization. This panel continues automatically.',
+  signInAppHint: 'The official sign-in page opened inside an app window. It closes automatically and the account is saved when you finish.',
       signInLink: 'Window did not open? Click here to open the authorization link.',
       signInCancel: 'Cancel sign-in',
       signedInNew: 'Signed in. The new account was added to the library.',
@@ -288,12 +292,20 @@ window.__ModuleLoader__.load({
             const attempt = snapshot.attempt
             if (attempt && attempt.authorizeUrl && openedUrl !== attempt.authorizeUrl) {
               openedUrl = attempt.authorizeUrl
-              setSignIn((prev) => ({ ...(prev || {}), id: attempt.id, authorizeUrl: attempt.authorizeUrl }))
-              try { window.open(attempt.authorizeUrl, '_blank') } catch { /* link fallback below */ }
+              let embedded = false
+              try {
+                const opened = await requestJson(SIGNIN_WINDOW_PATH, { method: 'POST', body: JSON.stringify({ url: attempt.authorizeUrl }) })
+                embedded = !!(opened && opened.embedded === true)
+              } catch { /* 窗口路由不可用，回退下方 */ }
+              if (!embedded) {
+                try { window.open(attempt.authorizeUrl, '_blank') } catch { /* link fallback below */ }
+              }
+              setSignIn((prev) => ({ ...(prev || {}), id: attempt.id, authorizeUrl: attempt.authorizeUrl, embedded }))
             }
             if (snapshot.status === 'credential-stored' && attempt && attempt.phase === 'succeeded') {
               stopped = true
               clearInterval(timer)
+              try { await requestJson(SIGNIN_WINDOW_CLOSE_PATH, { method: 'POST', body: '{}' }) } catch { /* 窗口已自行关闭 */ }
               const replaceId = reloginIdRef.current
               reloginIdRef.current = null
               try {
@@ -360,6 +372,7 @@ window.__ModuleLoader__.load({
           try { await ops.cancelSignIn(signIn.id) } catch { /* attempt may be gone */ }
         }
         reloginIdRef.current = null
+        try { await requestJson(SIGNIN_WINDOW_CLOSE_PATH, { method: 'POST', body: '{}' }) } catch { /* 窗口已自行关闭 */ }
         setSignIn(null)
         setNotice(t('signInCancelled'))
       })
@@ -440,7 +453,7 @@ window.__ModuleLoader__.load({
         signIn
           ? jsx('div', { className: 'asw-card', children: [
               jsx('div', { className: 'asw-label', children: t('addAccount') }, 'label'),
-              jsx('p', { className: 'asw-intro', children: t('signInHint') }, 'hint'),
+              jsx('p', { className: 'asw-intro', children: signIn.embedded ? t('signInAppHint') : t('signInHint') }, 'hint'),
               signIn.authorizeUrl
                 ? jsx('a', { className: 'asw-link', href: signIn.authorizeUrl, target: '_blank', rel: 'noreferrer', children: t('signInLink') }, 'link')
                 : null,
