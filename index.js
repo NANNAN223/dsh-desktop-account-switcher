@@ -1,5 +1,5 @@
 /**
- * dsh-desktop-account-switcher v2 — host half (asw2-3).
+ * dsh-desktop-account-switcher v2 — host half (asw2-4).
  *
  * v2 additions over v1: pinned flag per account (PIN_PATH), re-login swap
  * (save accepts replaceId: the fresh grant carries over alias/addedAt/pinned
@@ -12,10 +12,13 @@
  * probed against /auth-api/v0/users/current shortly after boot and on an
  * interval (default 6h), so the whole library stays verifiably signed in;
  * entries gain checkedAt/lastOkAt and manual per-account/all checks.
+ * asw2-4: selective keep-alive (KEEPALIVE_PATH) — each entry can opt out of
+ * scheduled checks with keepAlive:false; the opt-out survives save/re-login.
  *
  * Library: <DSH_HOME>/account-switcher/accounts.json
  *   { "version": 1, "accounts": [ { id, token, issuer, name, contact,
- *       avatarUrl, alias, addedAt, invalid?, pinned?, checkedAt?, lastOkAt? } ] }
+ *       avatarUrl, alias, addedAt, invalid?, pinned?, checkedAt?, lastOkAt?,
+ *       keepAlive? } ] }
  * Account id = first 12 hex chars of sha256(token).
  */
 import { createHash } from 'node:crypto'
@@ -36,6 +39,7 @@ export const PIN_PATH = '/dsh-desktop/account-switcher/pin'
 export const SIGNIN_WINDOW_PATH = '/dsh-desktop/account-switcher/signin-window'
 export const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/close'
 export const CHECK_PATH = '/dsh-desktop/account-switcher/check'
+export const KEEPALIVE_PATH = '/dsh-desktop/account-switcher/keep-alive'
 
 
 /** Credentials record holding the active Platform grant (kind: grant). */
@@ -44,7 +48,7 @@ const DEFAULT_ISSUER = 'https://platform.deepseek.com'
 const PROFILE_TIMEOUT_MS = 8000
 const MAX_BODY_BYTES = 64 * 1024
 const STORE_VERSION = 1
-const LIB_VERSION = 'asw2-3'
+const LIB_VERSION = 'asw2-4'
 // Keep-alive cadence; env overrides exist so tests can shorten them.
 const CHECK_BOOT_DELAY_MS = Math.max(0, Number(process.env.DSH_ASW_CHECK_DELAY_MS) || 20 * 1000)
 const CHECK_INTERVAL_MS = Math.max(60 * 1000, Number(process.env.DSH_ASW_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000)
@@ -269,6 +273,8 @@ export async function apply(ctx) {
     }
     const pinned = existing?.pinned === true || carry?.pinned === true
     if (pinned) entry.pinned = true
+    // Keep-alive opt-out survives save and re-login swap.
+    if (existing?.keepAlive === false || carry?.keepAlive === false) entry.keepAlive = false
     if (entry.name !== null) entry.invalid = false
     // Replace the stale entry when re-login carried it over.
     const carryId = carry?.id
@@ -296,6 +302,9 @@ export async function apply(ctx) {
           rows.push({ row: null, token: active.token, issuer: active.issuer })
         }
         for (const item of rows) {
+          // Accounts opted out of keep-alive are never probed in the background
+          // (their stored display name stays as-is); manual checks still work.
+          if (item.row?.keepAlive === false) continue
           const id = fingerprint(item.token)
           const cached = profileCache.get(id)
           if (cached && cached.name !== null && cached.name !== undefined) continue
@@ -373,6 +382,7 @@ export async function apply(ctx) {
     try {
       const library = await readLibrary()
       for (const row of library.accounts) {
+        if (row.keepAlive === false) continue
         await checkAccountRow(row.id)
         await new Promise((resolve) => setTimeout(resolve, CHECK_GAP_MS))
       }
@@ -396,6 +406,7 @@ export async function apply(ctx) {
         alias: entry?.alias ?? null,
         checkedAt: entry?.checkedAt ?? null,
         lastOkAt: entry?.lastOkAt ?? null,
+        keepAlive: entry?.keepAlive !== false,
         invalid: cached.invalid === true || entry?.invalid === true,
         pinned: entry?.pinned === true
       }
@@ -486,7 +497,7 @@ export async function apply(ctx) {
             const library = await readLibrary()
             const stale = library.accounts.find((row) => row.id === replaceId)
             if (stale && stale.id !== fingerprint(active.token)) {
-              carry = { id: stale.id, alias: stale.alias ?? null, addedAt: stale.addedAt, pinned: stale.pinned === true }
+              carry = { id: stale.id, alias: stale.alias ?? null, addedAt: stale.addedAt, pinned: stale.pinned === true, keepAlive: stale.keepAlive }
             }
           }
           const entry = await upsertLibrary(active, profileCache.get(fingerprint(active.token)) ?? null, carry)
@@ -631,6 +642,32 @@ export async function apply(ctx) {
       }
     })
 
+    const disposeKeepAlive = webCtx.webServer.register({
+      kind: 'exact',
+      path: KEEPALIVE_PATH,
+      handler: async (req, res) => {
+        if (postOnly(req, res)) return
+        const body = await readBody(req)
+        await withCredentials(res, async (credentials) => {
+          const targetId = typeof body.id === 'string' ? body.id : ''
+          const library = await readLibrary()
+          if (!library.accounts.some((row) => row.id === targetId)) {
+            sendJson(res, 404, { error: '账号库中找不到该账号。' })
+            return
+          }
+          const next = library.accounts.map((row) => {
+            if (row.id !== targetId) return row
+            const updated = { ...row }
+            if (body.keepAlive === false) updated.keepAlive = false
+            else delete updated.keepAlive
+            return updated
+          })
+          await writeLibrary(next)
+          sendJson(res, 200, await buildState(credentials))
+        })
+      }
+    })
+
     const SIGNIN_WINDOW_TITLE = 'DeepSeek 登录 / Sign in'
 
     const isAllowedLoginUrl = (value) => {
@@ -746,6 +783,7 @@ export async function apply(ctx) {
       disposeSignWindow()
       disposePin()
       disposeCheck()
+      disposeKeepAlive()
       disposeRename()
       disposeRemove()
       disposeSwitch()

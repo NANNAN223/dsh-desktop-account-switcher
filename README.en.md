@@ -1,6 +1,6 @@
 # dsh-desktop-account-switcher
 
-Save, label and switch multiple DeepSeek accounts in DSH Desktop (Settings → Accounts). Tokens stay on your machine; switching rewrites the platform credential grant and auto-refreshes the page. Every saved account is re-checked in the background (shortly after boot, then every 6h) so the whole library stays verifiably signed in — switching never signs the others out. See [README.md](./README.md) (Chinese) for full docs.
+Save, label and switch multiple DeepSeek accounts in DSH Desktop (Settings → Accounts). Tokens stay on your machine; switching rewrites the platform credential grant and auto-refreshes the page. Every saved account is re-checked in the background (shortly after boot, then every 6h) so the whole library stays verifiably signed in — switching never signs the others out. A per-row 保活 / Keep alive toggle chooses which accounts join those checks, and the panel footer links to the GitHub project. See [README.md](./README.md) (Chinese) for full docs.
 
 ## Install
 
@@ -24,7 +24,7 @@ and restart DSH. Update with `git pull` inside the plugin folder.
 
 ## HTTP API (localhost only)
 
-GET `/dsh-desktop/account-switcher/state` · POST `save` · `switch {"id"}` · `rename {"id","name"}` (empty string clears) · `remove {"id"}` (409 for the active account) · `pin {"id","pinned"}` · `check {}` or `check {"id"}` · `signin-window {"url"}` / `signin-window/close`.
+GET `/dsh-desktop/account-switcher/state` · POST `save` · `switch {"id"}` · `rename {"id","name"}` (empty string clears) · `remove {"id"}` (409 for the active account) · `pin {"id","pinned"}` · `check {}` or `check {"id"}` · `keep-alive {"id","keepAlive"}` · `signin-window {"url"}` / `signin-window/close`.
 
 ## License
 
