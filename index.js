@@ -1,5 +1,5 @@
 /**
- * dsh-desktop-account-switcher v2 — host half (asw2-2).
+ * dsh-desktop-account-switcher v2 — host half (asw2-3).
  *
  * v2 additions over v1: pinned flag per account (PIN_PATH), re-login swap
  * (save accepts replaceId: the fresh grant carries over alias/addedAt/pinned
@@ -8,10 +8,14 @@
  * platform sign-in page opens in a frameless BrowserWindow; navigation to
  * /oauth/callback auto-closes it ~1.2s later. Falls back to window.open when
  * electron is unavailable.
+ * asw2-3: multi-account keep-alive (CHECK_PATH) — every stored token is
+ * probed against /auth-api/v0/users/current shortly after boot and on an
+ * interval (default 6h), so the whole library stays verifiably signed in;
+ * entries gain checkedAt/lastOkAt and manual per-account/all checks.
  *
  * Library: <DSH_HOME>/account-switcher/accounts.json
  *   { "version": 1, "accounts": [ { id, token, issuer, name, contact,
- *       avatarUrl, alias, addedAt, invalid?, pinned? } ] }
+ *       avatarUrl, alias, addedAt, invalid?, pinned?, checkedAt?, lastOkAt? } ] }
  * Account id = first 12 hex chars of sha256(token).
  */
 import { createHash } from 'node:crypto'
@@ -31,6 +35,7 @@ export const RENAME_PATH = '/dsh-desktop/account-switcher/rename'
 export const PIN_PATH = '/dsh-desktop/account-switcher/pin'
 export const SIGNIN_WINDOW_PATH = '/dsh-desktop/account-switcher/signin-window'
 export const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/close'
+export const CHECK_PATH = '/dsh-desktop/account-switcher/check'
 
 
 /** Credentials record holding the active Platform grant (kind: grant). */
@@ -39,7 +44,11 @@ const DEFAULT_ISSUER = 'https://platform.deepseek.com'
 const PROFILE_TIMEOUT_MS = 8000
 const MAX_BODY_BYTES = 64 * 1024
 const STORE_VERSION = 1
-const LIB_VERSION = 'asw2-2'
+const LIB_VERSION = 'asw2-3'
+// Keep-alive cadence; env overrides exist so tests can shorten them.
+const CHECK_BOOT_DELAY_MS = Math.max(0, Number(process.env.DSH_ASW_CHECK_DELAY_MS) || 20 * 1000)
+const CHECK_INTERVAL_MS = Math.max(60 * 1000, Number(process.env.DSH_ASW_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000)
+const CHECK_GAP_MS = 400
 const MAX_ALIAS = 40
 // Real client version; keep in sync when upgrading DSH.
 const CLIENT_VERSION = '0.2.0-rc.2'
@@ -320,6 +329,60 @@ export async function apply(ctx) {
     refreshTimer.unref?.()
   }
 
+  // ---- multi-account keep-alive -------------------------------------------
+  // Probing one token = GET /auth-api/v0/users/current with that token. Only
+  // an HTTP 401 marks an account invalid; network or protocol hiccups leave
+  // the previous status untouched so a flaky connection never logs accounts
+  // out on paper. Everything runs through writeLibrary's serialized chain.
+  let checkTimer = null
+  let checkInterval = null
+  let checking = false
+
+  const patchAccount = async (id, patch) => {
+    const library = await readLibrary()
+    await writeLibrary(library.accounts.map((row) => row.id === id ? { ...row, ...patch } : row))
+  }
+
+  const checkAccountRow = async (id) => {
+    const library = await readLibrary()
+    const row = library.accounts.find((item) => item.id === id)
+    if (!row) return null
+    const outcome = await queryProfile(row.issuer || DEFAULT_ISSUER, row.token)
+    const now = Date.now()
+    if (outcome.unauthorized) {
+      await patchAccount(id, { checkedAt: now, invalid: true })
+      profileCache.set(fingerprint(row.token), { name: null, contact: null, avatarUrl: null, invalid: true })
+      return { id, online: false }
+    }
+    const patch = { checkedAt: now }
+    if (outcome.profile) {
+      patch.invalid = false
+      patch.lastOkAt = now
+      patch.name = outcome.profile.name
+      patch.contact = outcome.profile.contact
+      patch.avatarUrl = outcome.profile.avatarUrl
+      profileCache.set(fingerprint(row.token), outcome.profile)
+    }
+    await patchAccount(id, patch)
+    return { id, online: outcome.profile ? true : null }
+  }
+
+  const checkAllAccounts = async () => {
+    if (checking) return
+    checking = true
+    try {
+      const library = await readLibrary()
+      for (const row of library.accounts) {
+        await checkAccountRow(row.id)
+        await new Promise((resolve) => setTimeout(resolve, CHECK_GAP_MS))
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(error instanceof Error ? error : new Error(String(error)))
+    } finally {
+      checking = false
+    }
+  }
+
   const buildState = async (credentials) => {
     const [library, active] = [await readLibrary(), await readActiveGrant(credentials)]
     const activeId = active === null ? null : fingerprint(active.token)
@@ -331,6 +394,8 @@ export async function apply(ctx) {
         contact: cached.contact ?? entry?.contact ?? null,
         avatarUrl: cached.avatarUrl ?? entry?.avatarUrl ?? null,
         alias: entry?.alias ?? null,
+        checkedAt: entry?.checkedAt ?? null,
+        lastOkAt: entry?.lastOkAt ?? null,
         invalid: cached.invalid === true || entry?.invalid === true,
         pinned: entry?.pinned === true
       }
@@ -543,6 +608,29 @@ export async function apply(ctx) {
       }
     })
 
+    const disposeCheck = webCtx.webServer.register({
+      kind: 'exact',
+      path: CHECK_PATH,
+      handler: async (req, res) => {
+        if (postOnly(req, res)) return
+        const body = await readBody(req)
+        await withCredentials(res, async (credentials) => {
+          const target = typeof body?.id === 'string' && body.id !== '' ? body.id : null
+          if (target) {
+            const library = await readLibrary()
+            if (!library.accounts.some((row) => row.id === target)) {
+              sendJson(res, 404, { error: '账号库中找不到该账号。' })
+              return
+            }
+            await checkAccountRow(target)
+          } else {
+            await checkAllAccounts()
+          }
+          sendJson(res, 200, { ...(await buildState(credentials)), checked: target || 'all' })
+        })
+      }
+    })
+
     const SIGNIN_WINDOW_TITLE = 'DeepSeek 登录 / Sign in'
 
     const isAllowedLoginUrl = (value) => {
@@ -643,11 +731,21 @@ export async function apply(ctx) {
 
     scheduleNameRefresh(1200)
 
+    // Keep-alive: probe the whole library shortly after boot, then on the
+    // interval. Timers ride the plugin scope so dispose cancels them.
+    checkTimer = setTimeout(() => { void checkAllAccounts() }, CHECK_BOOT_DELAY_MS)
+    checkTimer.unref?.()
+    checkInterval = setInterval(() => { void checkAllAccounts() }, CHECK_INTERVAL_MS)
+    checkInterval.unref?.()
+
     return () => {
       closeSignWindow()
+      clearTimeout(checkTimer)
+      clearInterval(checkInterval)
       disposeSignWindowClose()
       disposeSignWindow()
       disposePin()
+      disposeCheck()
       disposeRename()
       disposeRemove()
       disposeSwitch()

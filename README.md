@@ -11,6 +11,8 @@ DSH Desktop 的 DeepSeek 多账号切换插件:在 **设置 → 账号切换** �
 - **添加时间**:每个账号显示入库时间
 - **失效标记与原地重登**:token 失效的账号自动标记,一键「重新登录」后新凭据自动继承原账号的备注/添加时间/置顶;当前使用中的账号禁止删除
 - **置顶**:常用账号可置顶,账号库内始终排在最前
+- **多账号保活**:启动后自动复检账号库内全部账号,之后每 6 小时一次;切换账号不会把其他账号挤下线
+- **在线状态**:每个账号显示 使用中 / 在线(绿)/ 未检查(灰)/ 已失效(红) 徽章,另有「检查全部」一键复检
 - **自检信息**:面板底部显示插件版本、账号数、存储路径与最近检查时间
 - 中英双语,跟随系统语言
 
@@ -82,6 +84,7 @@ notepad "$env:APPDATA\dsh-desktop\harness\profiles\web\cordis.patch.yml"
 | POST | `/dsh-desktop/account-switcher/pin` | `{"id","pinned"}` 置顶/取消置顶 |
 | POST | `/dsh-desktop/account-switcher/signin-window` | `{"url"}` 在应用内窗口打开官方登录页(仅允许 deepseek.com) |
 | POST | `/dsh-desktop/account-switcher/signin-window/close` | 关闭登录窗口 |
+| POST | `/dsh-desktop/account-switcher/check` | `{}` 复检全部账号,`{"id"}` 复检单个;返回最新状态 |
 
 ## 兼容性
 

@@ -1,8 +1,10 @@
 /**
- * dsh-desktop-account-switcher v2 — client half (asw2-1).
+ * dsh-desktop-account-switcher v2 — client half (asw2-3).
  * Adds a "账号切换 / Accounts" section to the desktop Settings page.
  * v2: pinned accounts sort first, invalid accounts can re-login in place
  * (carry-over swap), and the panel shows a self-check footer.
+ * asw2-3: keep-alive status pills per account (在线 / 未检查 / 已失效) plus a
+ * 检查全部 button that POSTs the host check route and reports the tally.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-desktop-account-switcher',
@@ -17,17 +19,18 @@ window.__ModuleLoader__.load({
     const REMOVE_PATH = '/dsh-desktop/account-switcher/remove'
     const RENAME_PATH = '/dsh-desktop/account-switcher/rename'
     const PIN_PATH = '/dsh-desktop/account-switcher/pin'
+    const CHECK_PATH = '/dsh-desktop/account-switcher/check'
 const SIGNIN_WINDOW_PATH = '/dsh-desktop/account-switcher/signin-window'
 const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/close'
     const NS = 'settings.accountSwitcher'
-    const LIB_VERSION = 'asw2-2'
+    const LIB_VERSION = 'asw2-3'
     const CLIENT_VERSION = '0.2.0-rc.2'
 
     const zh = {
       nav: '账号切换',
       title: 'DeepSeek 账号切换',
       intro: '保存多个 DeepSeek 账号，随时一键切换推理使用的账号。支持置顶常用账号、失效账号原地重新登录。',
-      hint: '切换立即生效，当前对话会改用新账号。账号令牌只保存在本机。',
+      hint: '切换立即生效，当前对话会改用新账号。账号令牌只保存在本机；账号库会定时保活检查（默认每 6 小时），账号互不挤下线，失效的可原地重新登录。',
       current: '当前账号',
       notSignedIn: '当前未登录任何账号。',
       fingerprint: '指纹',
@@ -66,13 +69,18 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
       renameCancel: '取消',
       renamePlaceholder: '输入备注名…',
       renamed: '已更新备注名。',
+      checkAll: '检查全部',
+      checking: '检查中…',
+      online: '在线',
+      unchecked: '未检查',
+      checkDone: '检查完成：{online}/{total} 个账号在线',
       meta: '自检'
     }
     const en = {
       nav: 'Accounts',
       title: 'DeepSeek account switching',
       intro: 'Save several DeepSeek accounts and switch the active one anytime. Pin favorites, re-login expired ones in place.',
-      hint: 'Switching applies immediately; new requests use the selected account. Tokens stay on this machine.',
+      hint: 'Switching applies immediately; new requests use the selected account. Tokens stay on this machine. Saved accounts are re-checked on a schedule (every 6h by default); switching never signs the others out.',
       current: 'Current account',
       notSignedIn: 'No account is signed in right now.',
       fingerprint: 'fingerprint',
@@ -111,6 +119,11 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
       renameCancel: 'Cancel',
       renamePlaceholder: 'Enter a display name…',
       renamed: 'Name updated.',
+      checkAll: 'Check all',
+      checking: 'Checking…',
+      online: 'Online',
+      unchecked: 'Not checked',
+      checkDone: 'Check done: {online}/{total} online',
       meta: 'Self-check'
     }
 
@@ -131,6 +144,7 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
       '.asw-badge { flex: none; font-size: 10px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--dsw-alias-border-primary, rgba(128,128,128,.35)); color: var(--dsw-alias-text-secondary, inherit); }',
       '.asw-badge-active { border-color: transparent; background: var(--dsw-alias-brand-primary, #4d6bfe); color: #fff; }',
       '.asw-badge-invalid { border-color: transparent; background: var(--dsw-alias-status-danger-bg, rgba(220,38,38,.15)); color: var(--dsw-alias-status-danger-text, #dc2626); }',
+      '.asw-badge-online { border-color: transparent; background: var(--dsw-alias-status-success-bg, rgba(22,163,74,.15)); color: var(--dsw-alias-status-success-text, #16a34a); }',
       '.asw-actions { display: flex; gap: 8px; flex-wrap: wrap; }',
       '.asw-input { flex: 1; min-width: 0; border: 1px solid rgba(127,127,127,.45); border-radius: 8px; padding: 4px 8px; font-size: 12px; background: transparent; color: inherit; }',
       '.asw-btn { appearance: none; border: 1px solid var(--dsw-alias-border-primary, rgba(128,128,128,.35)); background: transparent; color: var(--dsw-alias-text-primary, inherit); border-radius: 8px; padding: 5px 12px; font-size: 12px; cursor: pointer; }',
@@ -193,7 +207,9 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
             jsx('div', { className: 'asw-sub', children: [entry.addedAt ? t('addedAt') + ' ' + formatTime(entry.addedAt) : null, entry.alias ? entry.name : null, entry.contact, t('fingerprint') + ' ' + entry.id].filter(Boolean).join(' · ') })
           ] }, 'main'),
           entry.active ? jsx('span', { className: 'asw-badge asw-badge-active', children: t('active') }, 'badge') : null,
-          entry.invalid && !entry.active ? jsx('span', { className: 'asw-badge asw-badge-invalid', children: t('invalid') }, 'badge') : null,
+          !entry.active && entry.invalid ? jsx('span', { className: 'asw-badge asw-badge-invalid', children: t('invalid') }, 'badge') : null,
+          !entry.active && !entry.invalid && entry.lastOkAt ? jsx('span', { className: 'asw-badge asw-badge-online', title: entry.checkedAt ? formatTime(entry.checkedAt) : undefined, children: t('online') }, 'badge') : null,
+          !entry.active && !entry.invalid && !entry.lastOkAt ? jsx('span', { className: 'asw-badge', title: entry.checkedAt ? formatTime(entry.checkedAt) : undefined, children: t('unchecked') }, 'badge') : null,
           jsx('div', { className: 'asw-actions', children: renaming ? [
             jsx('input', {
               className: 'asw-input',
@@ -396,6 +412,14 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
         setNotice(entry.pinned ? t('unpinned') : t('pinned'))
       })
 
+      const checkAll = () => runAction('check', async () => {
+        const result = await requestJson(CHECK_PATH, { method: 'POST', body: '{}' })
+        if (result && Array.isArray(result.accounts)) {
+          const online = result.accounts.filter((row) => !row.invalid).length
+          setNotice(t('checkDone').replace('{online}', String(online)).replace('{total}', String(result.accounts.length)))
+        }
+      })
+
       const [renamingId, setRenamingId] = React.useState(null)
       const [renameValue, setRenameValue] = React.useState('')
       const renameAccount = (entry) => {
@@ -464,7 +488,10 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
           : jsx('button', { className: 'asw-btn', disabled: busy !== null, onClick: startAdd, children: busy === 'signin' ? '…' : t('addAccount') }, 'add'),
 
         jsx('div', { className: 'asw-card', children: [
-          jsx('div', { className: 'asw-label', children: t('library') }, 'label'),
+          jsx('div', { className: 'asw-card-head', children: [
+            jsx('span', { className: 'asw-label', children: t('library') }, 'label'),
+            jsx('button', { className: 'asw-btn', disabled: busy !== null, onClick: checkAll, children: busy === 'check' ? t('checking') : t('checkAll') }, 'check')
+          ] }, 'head'),
           sorted.length === 0
             ? jsx('p', { className: 'asw-empty', children: t('empty') }, 'empty')
             : jsx('div', { className: 'asw-list', children: sorted.map((entry) =>
