@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.4
+
+- 修复:「登录新账号」在 Windows 上仍然打开系统浏览器的问题——根因是 DSH Desktop 用 ELECTRON_RUN_AS_NODE 启动 harness 子进程,插件中拿不到 Electron 的 BrowserWindow,旧的 /signin-window 路由只能回退到 window.open 外部浏览器
+- 应用内登录窗口改为「回环桥接」:新增 GET /dsh-desktop/account-switcher/login-window?url=… 路由,校验后 302 到 *.deepseek.com 的 https 地址;渲染进程用 window.open 打开它,得到的是应用自己的真窗口(桌面外壳信任 127.0.0.1,且只给自己的主窗口装导航守卫),登录页因此在应用内打开,主进程不再把链接丢给系统浏览器
+- 登录窗句柄由面板持有:登录成功或取消登录时自动关闭窗口;仅当窗口完全打不开时才回退到外部浏览器
+- 说明:应用内窗口的 Cookie 与系统浏览器隔离,首次登录需在该窗口内输入手机号/密码;界面提示文案已相应更新
+- 安全:桥接路由要求 loopback 来源并拒绝带 forwarded 头的请求,重定向白名单与旧登录窗一致(仅 *.deepseek.com 的 https)
+
 ## 0.2.3
 
 - 新增:选择性保活——账号库每行新增「保活」勾选框,可自选哪些账号参与定时复检(默认全部参与)

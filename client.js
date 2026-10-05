@@ -1,5 +1,5 @@
 /**
- * dsh-desktop-account-switcher v2 — client half (asw2-4).
+ * dsh-desktop-account-switcher v2 — client half (asw2-5).
  * Adds a "账号切换 / Accounts" section to the desktop Settings page.
  * v2: pinned accounts sort first, invalid accounts can re-login in place
  * (carry-over swap), and the panel shows a self-check footer.
@@ -7,6 +7,9 @@
  * 检查全部 button that POSTs the host check route and reports the tally.
  * asw2-4: per-account 保活 checkbox (opt out of scheduled checks), a 不保活
  * pill for opted-out rows, and a GitHub project link at the panel footer.
+ * asw2-5: the sign-in page opens through LOGIN_WINDOW_PATH (trusted loopback
+ * bridge) so the window really appears in-app on Windows; the popup handle is
+ * kept so success/cancel closes it.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-desktop-account-switcher',
@@ -24,10 +27,11 @@ window.__ModuleLoader__.load({
     const CHECK_PATH = '/dsh-desktop/account-switcher/check'
 const SIGNIN_WINDOW_PATH = '/dsh-desktop/account-switcher/signin-window'
 const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/close'
+    const LOGIN_WINDOW_PATH = '/dsh-desktop/account-switcher/login-window'
     const KEEPALIVE_PATH = '/dsh-desktop/account-switcher/keep-alive'
     const REPO_URL = 'https://github.com/NANNAN223/dsh-desktop-account-switcher'
     const NS = 'settings.accountSwitcher'
-    const LIB_VERSION = 'asw2-4'
+    const LIB_VERSION = 'asw2-5'
     const CLIENT_VERSION = '0.2.0-rc.2'
 
     const zh = {
@@ -58,7 +62,7 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
       reloginDone: '已重新登录，账号已更新。',
       addAccount: '登录新账号…',
       signInHint: '浏览器窗口已打开授权页，完成登录后这里会自动继续。',
-  signInAppHint: '已在本应用窗口打开官方登录页，完成登录后窗口会自动关闭、账号自动入库。',
+      signInAppHint: '已在本应用窗口打开官方登录页（应用内窗口没有浏览器里的登录状态，若要求登录请直接输入手机号/密码）。完成后窗口自动关闭、账号自动入库。',
       signInLink: '打不开窗口？点这里手动打开授权链接。',
       signInCancel: '取消登录',
       signedInNew: '登录成功，新账号已加入账号库。',
@@ -114,7 +118,7 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
       reloginDone: 'Re-signed in; the account was updated.',
       addAccount: 'Sign in with another account…',
       signInHint: 'A browser window opened for authorization. This panel continues automatically.',
-  signInAppHint: 'The official sign-in page opened inside an app window. It closes automatically and the account is saved when you finish.',
+      signInAppHint: 'The official sign-in page opened inside an app window (it has no cookies from your browser, so sign in with your phone/password if asked). It closes and the account is saved when you finish.',
       signInLink: 'Window did not open? Click here to open the authorization link.',
       signInCancel: 'Cancel sign-in',
       signedInNew: 'Signed in. The new account was added to the library.',
@@ -313,6 +317,9 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
       // The poll interval captures the first render's closure, so re-login
       // targets ride along in a ref instead of state.
       const reloginIdRef = React.useRef(null)
+      // Handle of the in-app sign-in window opened via LOGIN_WINDOW_PATH, so
+      // this panel can close it when the attempt succeeds or is cancelled.
+      const signWindowRef = React.useRef(null)
 
       const refresh = React.useCallback(async () => {
         try {
@@ -324,6 +331,14 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
       }, [ops])
 
       React.useEffect(() => { refresh() }, [refresh])
+
+      const closeLoginWindow = React.useCallback(() => {
+        const win = signWindowRef.current
+        signWindowRef.current = null
+        try {
+          if (win && win.closed !== true) win.close()
+        } catch { /* 跨域窗口句柄关闭时可能抛错 */ }
+      }, [])
 
       // Poll the account service while a sign-in attempt runs.
       React.useEffect(() => {
@@ -345,7 +360,25 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
                 embedded = !!(opened && opened.embedded === true)
               } catch { /* 窗口路由不可用，回退下方 */ }
               if (!embedded) {
-                try { window.open(attempt.authorizeUrl, '_blank') } catch { /* link fallback below */ }
+                // The harness runs under ELECTRON_RUN_AS_NODE, so the host
+                // cannot create a BrowserWindow. The desktop shell trusts
+                // loopback URLs and only guards its own main window: opening
+                // this bridge in a popup yields a real in-app window that
+                // 302s to the official page. Keep the handle to close it.
+                let win = null
+                try {
+                  win = window.open(
+                    LOGIN_WINDOW_PATH + '?url=' + encodeURIComponent(attempt.authorizeUrl),
+                    '_blank',
+                    'width=430,height=680'
+                  )
+                } catch { win = null }
+                if (win && win.closed !== true) {
+                  signWindowRef.current = win
+                  embedded = true
+                } else {
+                  try { window.open(attempt.authorizeUrl, '_blank') } catch { /* link fallback below */ }
+                }
               }
               setSignIn((prev) => ({ ...(prev || {}), id: attempt.id, authorizeUrl: attempt.authorizeUrl, embedded }))
             }
@@ -353,6 +386,7 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
               stopped = true
               clearInterval(timer)
               try { await requestJson(SIGNIN_WINDOW_CLOSE_PATH, { method: 'POST', body: '{}' }) } catch { /* 窗口已自行关闭 */ }
+              closeLoginWindow()
               const replaceId = reloginIdRef.current
               reloginIdRef.current = null
               try {
@@ -374,8 +408,8 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
             }
           } catch { /* transient poll errors ignored */ }
         }, 1500)
-        return () => { stopped = true; clearInterval(timer) }
-      }, [signIn !== null, ops, refresh, t])
+        return () => { stopped = true; clearInterval(timer); closeLoginWindow() }
+      }, [signIn !== null, ops, refresh, t, closeLoginWindow])
 
       const runAction = async (key, action) => {
         if (busy) return
@@ -420,6 +454,7 @@ const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/cl
         }
         reloginIdRef.current = null
         try { await requestJson(SIGNIN_WINDOW_CLOSE_PATH, { method: 'POST', body: '{}' }) } catch { /* 窗口已自行关闭 */ }
+        closeLoginWindow()
         setSignIn(null)
         setNotice(t('signInCancelled'))
       })

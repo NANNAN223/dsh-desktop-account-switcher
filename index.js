@@ -1,5 +1,5 @@
 /**
- * dsh-desktop-account-switcher v2 — host half (asw2-4).
+ * dsh-desktop-account-switcher v2 — host half (asw2-5).
  *
  * v2 additions over v1: pinned flag per account (PIN_PATH), re-login swap
  * (save accepts replaceId: the fresh grant carries over alias/addedAt/pinned
@@ -14,6 +14,10 @@
  * entries gain checkedAt/lastOkAt and manual per-account/all checks.
  * asw2-4: selective keep-alive (KEEPALIVE_PATH) — each entry can opt out of
  * scheduled checks with keepAlive:false; the opt-out survives save/re-login.
+ * asw2-5: in-app sign-in window that actually works on Windows — the harness
+ * runs under ELECTRON_RUN_AS_NODE (no Electron API there), so LOGIN_WINDOW_PATH
+ * serves a trusted loopback window that 302-redirects to the official page;
+ * the desktop shell only guards its main window, so it opens in-app.
  *
  * Library: <DSH_HOME>/account-switcher/accounts.json
  *   { "version": 1, "accounts": [ { id, token, issuer, name, contact,
@@ -40,6 +44,7 @@ export const SIGNIN_WINDOW_PATH = '/dsh-desktop/account-switcher/signin-window'
 export const SIGNIN_WINDOW_CLOSE_PATH = '/dsh-desktop/account-switcher/signin-window/close'
 export const CHECK_PATH = '/dsh-desktop/account-switcher/check'
 export const KEEPALIVE_PATH = '/dsh-desktop/account-switcher/keep-alive'
+export const LOGIN_WINDOW_PATH = '/dsh-desktop/account-switcher/login-window'
 
 
 /** Credentials record holding the active Platform grant (kind: grant). */
@@ -48,7 +53,7 @@ const DEFAULT_ISSUER = 'https://platform.deepseek.com'
 const PROFILE_TIMEOUT_MS = 8000
 const MAX_BODY_BYTES = 64 * 1024
 const STORE_VERSION = 1
-const LIB_VERSION = 'asw2-4'
+const LIB_VERSION = 'asw2-5'
 // Keep-alive cadence; env overrides exist so tests can shorten them.
 const CHECK_BOOT_DELAY_MS = Math.max(0, Number(process.env.DSH_ASW_CHECK_DELAY_MS) || 20 * 1000)
 const CHECK_INTERVAL_MS = Math.max(60 * 1000, Number(process.env.DSH_ASW_CHECK_INTERVAL_MS) || 6 * 60 * 60 * 1000)
@@ -766,6 +771,44 @@ export async function apply(ctx) {
       }
     })
 
+    // In-app sign-in window. The desktop shell trusts http://127.0.0.1*
+    // (isTrustedAppUrl) and only installs its navigation guard on its own main
+    // window, so a renderer-side window.open() at this path becomes a real
+    // child window whose 302 target may be the official https:// page. The
+    // harness itself needs no Electron API for this.
+    const disposeLoginWindow = webCtx.webServer.register({
+      kind: 'exact',
+      path: LOGIN_WINDOW_PATH,
+      handler: (req, res) => {
+        if (!isTrustedRequest(req)) {
+          sendJson(res, 403, { error: 'Request rejected.' })
+          return
+        }
+        let target = ''
+        try {
+          target = new URL(req.url ?? '/', 'http://127.0.0.1').searchParams.get('url') ?? ''
+        } catch {
+          target = ''
+        }
+        if (!isAllowedLoginUrl(target)) {
+          const body = '仅支持打开 DeepSeek 官方登录页。'
+          res.writeHead(400, {
+            'content-type': 'text/plain; charset=utf-8',
+            'cache-control': 'no-store',
+            'content-length': Buffer.byteLength(body)
+          })
+          res.end(body)
+          return
+        }
+        res.writeHead(302, {
+          location: target,
+          'cache-control': 'no-store',
+          'referrer-policy': 'no-referrer'
+        })
+        res.end()
+      }
+    })
+
     scheduleNameRefresh(1200)
 
     // Keep-alive: probe the whole library shortly after boot, then on the
@@ -780,6 +823,7 @@ export async function apply(ctx) {
       clearTimeout(checkTimer)
       clearInterval(checkInterval)
       disposeSignWindowClose()
+      disposeLoginWindow()
       disposeSignWindow()
       disposePin()
       disposeCheck()

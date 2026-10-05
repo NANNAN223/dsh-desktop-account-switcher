@@ -5,7 +5,7 @@ DSH Desktop 的 DeepSeek 多账号切换插件:在 **设置 → 账号切换** �
 ## 功能
 
 - **保存当前账号**:把当前登录的 DeepSeek 账号存入本地账号库(token 仅存本机 `<DSH_HOME>/account-switcher/accounts.json`)
-- **登录新账号**:在应用内窗口直接打开 DeepSeek 官方登录页(手机号/验证码/微信扫码),无需切换到外部浏览器;登录成功后窗口自动关闭、账号自动入库(electron 不可用时自动回退外部浏览器)
+- **登录新账号**:在应用内窗口直接打开 DeepSeek 官方登录页(手机号/验证码/微信扫码),无需切换到外部浏览器;登录成功后窗口自动关闭、账号自动入库。应用内窗口与系统浏览器的 Cookie 隔离,第一次登录需在窗口内输入手机号/密码;仅当窗口完全打不开时才回退外部浏览器
 - **一键切换**:切换后自动刷新页面,全站以新账号身份生效
 - **备注名**:给账号起别名(≤40 字),与官方资料名分开存储,留空恢复默认
 - **添加时间**:每个账号显示入库时间
@@ -86,6 +86,7 @@ notepad "$env:APPDATA\dsh-desktop\harness\profiles\web\cordis.patch.yml"
 | POST | `/dsh-desktop/account-switcher/pin` | `{"id","pinned"}` 置顶/取消置顶 |
 | POST | `/dsh-desktop/account-switcher/signin-window` | `{"url"}` 在应用内窗口打开官方登录页(仅允许 deepseek.com) |
 | POST | `/dsh-desktop/account-switcher/signin-window/close` | 关闭登录窗口 |
+| GET | `/dsh-desktop/account-switcher/login-window?url=<encodeURIComponent(登录地址)>` | 应用内登录窗口的回环桥:校验后 302 跳转到 *.deepseek.com 的 https 页面(桌面外壳信任 127.0.0.1,所以渲染进程 window.open 它会得到应用自己的窗口) |
 | POST | `/dsh-desktop/account-switcher/check` | `{}` 复检全部账号,`{"id"}` 复检单个;返回最新状态 |
 | POST | `/dsh-desktop/account-switcher/keep-alive` | `{"id","keepAlive"}` 设置该账号是否参与定时保活(`false` 关闭 / `true` 开启) |
 
